@@ -284,6 +284,18 @@ class Search(Base):
         self.assertEqual(code, 0)
         self.assertEqual(out.strip(), "cd %s && claude --resume abc123" % shlex.quote(cwd))
 
+    def test_results_carry_a_resume_command(self):
+        cwd = os.path.join(self.tmp.name, "proj dir")
+        os.makedirs(cwd)
+        self.write(self.path("r1", cwd=cwd), [self.user("r1", "copyword", cwd=cwd)])
+        self.write(self.path("r2", cwd="/w/gone"), [self.user("r2", "copyword", cwd="/w/gone")])
+        self.index()
+        res = {r["id"]: r["resume"] for r in cc.search(self.con, ["copyword"], include_tmp=True)}
+        self.assertEqual(res["r1"], "cd %s && claude --resume r1" % shlex.quote(cwd))
+        self.assertEqual(res["r2"], "claude --resume r2")  # its directory no longer exists
+        code, out = self.run_main(["copyword", "--include-tmp"])
+        self.assertIn("claude --resume r2", out)
+
     def test_open_by_rank_and_refuses_x_inside_claude(self):
         self.write(self.path("s1"), [self.user("s1", "rankword")])
         self.index()

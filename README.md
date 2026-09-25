@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Clumsynite/claude-ccfind/actions/workflows/ci.yml/badge.svg)](https://github.com/Clumsynite/claude-ccfind/actions/workflows/ci.yml)
 [![Release workflow](https://github.com/Clumsynite/claude-ccfind/actions/workflows/release.yml/badge.svg)](https://github.com/Clumsynite/claude-ccfind/actions/workflows/release.yml)
-[![Release](https://img.shields.io/badge/release-v0.1.0-blue)](https://github.com/Clumsynite/claude-ccfind/releases)
+[![Release](https://img.shields.io/badge/release-v0.1.1-blue)](https://github.com/Clumsynite/claude-ccfind/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Find any past Claude Code session by what was said in it, across every project, then resume it. Also
@@ -29,7 +29,8 @@ takes a few milliseconds.
 ## Search
 
 ```sh
-ccfind stripe webhook             # sessions containing all the words, best match first
+ccfind stripe webhook             # sessions containing all the words, best match first;
+                                   # each result ends with a copy-paste `cd … && claude --resume …` line
 ccfind -p api --since 14d deploy   # filter by project substring and date (7d, 12h, 2026-09-01)
 ccfind -b main login bug           # filter by git branch
 ccfind --any foo bar               # any word instead of all

@@ -1021,7 +1021,8 @@ def search(con, terms, any_=False, raw=False, no_agents=False, include_tmp=False
         out.append({"rank": rank, "id": sid, "cwd": cwd, "project": short_project(cwd or proj),
                     "branch": (branches or "").replace(",", ", "), "title": ctitle or atitle or first or "",
                     "started": started, "ended": ended, "snippet": snip, "path": path,
-                    "hits": n_hits, "messages": n_msgs, "score": round(score, 4)})
+                    "hits": n_hits, "messages": n_msgs, "score": round(score, 4),
+                    "resume": resume_command(cwd, sid)})
     return out
 
 
@@ -1041,6 +1042,13 @@ def snippet(con, or_q, sid, where):
     return ""
 
 
+def resume_command(cwd, sid):
+    """The shell command that resumes a session: cd into its directory when that still exists."""
+    if cwd and os.path.isdir(cwd):
+        return "cd %s && claude --resume %s" % (shlex.quote(cwd), sid)
+    return "claude --resume %s" % sid
+
+
 def print_results(res):
     if not res:
         print("no matches")
@@ -1053,7 +1061,7 @@ def print_results(res):
         print(f"{r['rank']:>2}  {date}  {r['project']}  [{branch}]  {title}")
         if r["snippet"]:
             print(f"      {r['snippet'][:160]}")
-        print(f"      id: {r['id']}")
+        print(f"      {r['resume']}")
 
 
 def save_last(res):
@@ -1096,10 +1104,8 @@ def cmd_open(con, args):
     row = con.execute("SELECT cwd, path FROM sessions WHERE id=?", (sid,)).fetchone()
     cwd, path = row if row else (None, None)
     exists = bool(cwd) and os.path.isdir(cwd)
-    if exists:
-        print(f"cd {shlex.quote(cwd)} && claude --resume {sid}")
-    else:
-        print(f"claude --resume {sid}")
+    print(resume_command(cwd, sid))
+    if not exists:
         print(f"ccfind: working directory {cwd or '?'} no longer exists; resuming without cd", file=sys.stderr)
     if not args.x:
         return 0

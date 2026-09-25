@@ -29,6 +29,5 @@ guess from memory.
    `--any` added before `--`, and label the new results as partial matches.
 4. Show a compact table with these columns: `#`, date (from `ended`), project, title, and the snippet
    (brackets mark the matching words). Show the full session `id` under each row.
-5. Finish with the resume command for the top result, taken from the `cwd` and `id` fields:
-   `cd '<cwd>' && claude --resume <id>`. Mention that `ccfind open <n>` prints the command for any row.
+5. Finish with the top result's `resume` field in its own code block, so it can be copied as is. Mention that `ccfind open <n>` prints the command for any row.
    Don't run `claude` yourself.

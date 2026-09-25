@@ -32,6 +32,11 @@ jobs:
           version=$(jq -r .version .claude-plugin/plugin.json)
           grep -q "img.shields.io/badge/release-v$version-blue" README.md \
             || { echo "::error::README release badge doesn't say v$version; update it with the version bump"; exit 1; }
+      - name: CHANGELOG has an entry for plugin.json version
+        run: |
+          version=$(jq -r .version .claude-plugin/plugin.json)
+          grep -Eq "^## \[$version\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md \
+            || { echo "::error::CHANGELOG.md has no '## [$version] - YYYY-MM-DD' section; add one with the version bump"; exit 1; }
 
   test:
     strategy:

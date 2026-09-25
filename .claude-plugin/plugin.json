@@ -1,6 +1,6 @@
 {
   "name": "ccfind",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Find any past Claude Code session by what was said in it, across every project, and see your word bank and usage stats. A local SQLite full-text index over your transcripts; no model calls for the search itself.",
   "author": {
     "name": "Clumsyknight",
