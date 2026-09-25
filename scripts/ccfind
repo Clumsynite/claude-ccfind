@@ -835,7 +835,12 @@ FROM hits {where} GROUP BY session_id
 """
 
 
-def search(con, terms, any_=False, raw=False, no_agents=False, no_tmp=False, exclude_current=False,
+def hidden_session(is_tmp, entrypoint):
+    """Headless runs (claude -p / SDK) and /tmp sessions are hidden unless --include-tmp."""
+    return bool(is_tmp) or entrypoint == "sdk-cli"
+
+
+def search(con, terms, any_=False, raw=False, no_agents=False, include_tmp=False, exclude_current=False,
            project=None, branch=None, since=None, limit=10):
     excluded_roles = ["tool"] if get_mode(con) != "deep" else []
     if no_agents:
@@ -872,7 +877,7 @@ def search(con, terms, any_=False, raw=False, no_agents=False, no_tmp=False, exc
     for i in range(0, len(ids), 500):
         part = ids[i:i + 500]
         for s in con.execute("SELECT id, cwd, project_dir, branches, custom_title, ai_title, first_prompt, "
-                             "started, ended, path, is_tmp, n_msgs FROM sessions WHERE id IN (%s)"
+                             "started, ended, path, is_tmp, n_msgs, entrypoint FROM sessions WHERE id IN (%s)"
                              % ",".join("?" * len(part)), part):
             meta[s[0]] = s
     cutoff = since_cutoff(since)
@@ -883,8 +888,8 @@ def search(con, terms, any_=False, raw=False, no_agents=False, no_tmp=False, exc
         m = meta.get(sid)
         if not m:
             continue
-        _, cwd, proj, branches, ctitle, atitle, first, started, ended, path, is_tmp, n_msgs = m
-        if no_tmp and is_tmp:
+        _, cwd, proj, branches, ctitle, atitle, first, started, ended, path, is_tmp, n_msgs, entry = m
+        if not include_tmp and hidden_session(is_tmp, entry):
             continue
         if current and sid == current:
             continue
@@ -902,7 +907,7 @@ def search(con, terms, any_=False, raw=False, no_agents=False, no_tmp=False, exc
     scored.sort(key=lambda x: x[0])
     out = []
     for rank, (score, sid, m, n_hits) in enumerate(scored[:limit], 1):
-        _, cwd, proj, branches, ctitle, atitle, first, started, ended, path, is_tmp, n_msgs = m
+        _, cwd, proj, branches, ctitle, atitle, first, started, ended, path, is_tmp, n_msgs, entry = m
         snip = snippet(con, or_q, sid, where)
         out.append({"rank": rank, "id": sid, "cwd": cwd, "project": short_project(cwd or proj),
                     "branch": (branches or "").replace(",", ", "), "title": ctitle or atitle or first or "",
@@ -1151,12 +1156,14 @@ def load_prices():
         return None
 
 
-def compute_stats(con, project=None, since=None, top=20):
+def compute_stats(con, project=None, since=None, top=20, include_tmp=False, max_prompt_lines=6):
     cutoff = since_cutoff(since)
     sess = {}
     for r in con.execute("SELECT id, cwd, project_dir, custom_title, ai_title, first_prompt, started, ended, "
-                         "n_msgs, n_user, n_assistant FROM sessions"):
+                         "n_msgs, n_user, n_assistant, is_tmp, entrypoint FROM sessions"):
         sid, cwd, proj = r[0], r[1], r[2]
+        if not include_tmp and hidden_session(r[11], r[12]):
+            continue
         if project and project.lower() not in (cwd or "").lower() and project.lower() not in (proj or "").lower():
             continue
         sess[sid] = r
@@ -1167,7 +1174,7 @@ def compute_stats(con, project=None, since=None, top=20):
             if r[0] in ok and (not cutoff or (r[1] or "") >= cutoff):
                 yield r
 
-    user = list(rows("SELECT session_id, ts, words, lines, queued, clean FROM prompts WHERE role='user'"))
+    user = list(rows("SELECT session_id, ts, words, lines, queued, clean, raw_lines FROM prompts WHERE role='user'"))
     asst = list(rows("SELECT session_id, ts, words, lines, queued, clean FROM prompts WHERE role='assistant'"))
     active = {r[0] for r in user} | {r[0] for r in asst}
     if cutoff:
@@ -1183,7 +1190,7 @@ def compute_stats(con, project=None, since=None, top=20):
     wk_words = collections.defaultdict(list)
     proj_sessions = collections.defaultdict(set)
     proj_prompts = collections.Counter()
-    for sid, ts, words, lines, queued, clean in user:
+    for sid, ts, words, lines, queued, clean, raw_lines in user:
         d = local(ts)
         proj_sessions[label[sid]].add(sid)
         proj_prompts[label[sid]] += 1
@@ -1231,7 +1238,11 @@ def compute_stats(con, project=None, since=None, top=20):
                      "words": r[2], "start": " ".join(r[5].split())[:100]} for r in longest],
     }
     # 4/5 word banks
-    your_words = word_bank([(r[0], r[5]) for r in user], top, True)
+    # prompts with many lines are almost always pasted output (logs, tool results), not your own words
+    typed = [r for r in user if not max_prompt_lines or (r[6] or 0) <= max_prompt_lines]
+    your_words = word_bank([(r[0], r[5]) for r in typed], top, True)
+    your_words["paste_like_excluded"] = len(user) - len(typed)
+    your_words["max_prompt_lines"] = max_prompt_lines
     cmds = collections.Counter(r[2] for r in rows("SELECT session_id, ts, name FROM events WHERE kind='command'"))
     your_words["commands"] = [{"command": "/" + c, "count": n} for c, n in cmds.most_common(top)]
     claude_words = word_bank([(r[0], r[5]) for r in asst], top, False)
@@ -1359,6 +1370,8 @@ def print_stats(s):
     for key, title in (("your_words", "Word bank: you"), ("claude_words", "Word bank: Claude")):
         w = s[key]
         print(f"\n== {title}")
+        if w.get("paste_like_excluded"):
+            print(f"  ({w['paste_like_excluded']} paste-like prompts over {w['max_prompt_lines']} lines left out)")
         print("  words: " + ", ".join(f"{x['word']} {x['messages']}/{x['sessions']}s" for x in w["words"]))
         print("  pairs: " + ", ".join(f"{x['pair']} {x['messages']}" for x in w["pairs"]))
         if "openers" in w:
@@ -1543,7 +1556,10 @@ def render_html(s):
         f'<div><h3>You</h3>{svg_hbars([(x["word"], x["messages"]) for x in yw["words"][:15]], "var(--c1)")}</div>'
         f'<div><h3>Claude</h3>{svg_hbars([(x["word"], x["messages"]) for x in cw["words"][:15]], "var(--c2)")}</div>'
         '</div></div>',
-        '<div class=card><h2>How your requests usually look</h2><div class=two><div>'
+        '<div class=card><h2>How your requests usually look</h2>'
+        + (f'<p class=muted>{yw["paste_like_excluded"]} paste-like prompts over {yw["max_prompt_lines"]} lines '
+           'left out of your word bank.</p>' if yw.get("paste_like_excluded") else "")
+        + '<div class=two><div>'
         + _table(["opener", "count"], [(x["opener"], x["count"]) for x in yw.get("openers", [])[:12]])
         + "</div><div>"
         + _table(["words per prompt", "prompts"], list(p["buckets"].items()))
@@ -1859,7 +1875,7 @@ def run(args, cons):
             if got:
                 index_all(con)
     if args.cmd == "search":
-        res = search(con, args.terms, any_=args.any, raw=args.raw, no_agents=args.no_agents, no_tmp=args.no_tmp,
+        res = search(con, args.terms, any_=args.any, raw=args.raw, no_agents=args.no_agents, include_tmp=args.include_tmp,
                      exclude_current=args.exclude_current, project=args.project, branch=args.branch,
                      since=args.since, limit=args.n)
         save_last(res)
@@ -1873,7 +1889,8 @@ def run(args, cons):
     if args.cmd == "show":
         return cmd_show(con, args)
     if args.cmd == "stats":
-        s = compute_stats(con, project=args.project, since=args.since, top=args.top)
+        s = compute_stats(con, project=args.project, since=args.since, top=args.top, include_tmp=args.include_tmp,
+                          max_prompt_lines=args.max_prompt_lines)
         if args.html:
             with open(args.html, "w") as f:
                 f.write(render_html(s))
