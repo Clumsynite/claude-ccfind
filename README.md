@@ -24,15 +24,15 @@ takes a few milliseconds.
 ## Search
 
 ```sh
-ccfind rapido uber                 # sessions containing all the words, best match first
-ccfind -p ems --since 14d deploy   # filter by project substring and date (7d, 12h, 2026-09-01)
+ccfind stripe webhook             # sessions containing all the words, best match first
+ccfind -p api --since 14d deploy   # filter by project substring and date (7d, 12h, 2026-09-01)
 ccfind -b main login bug           # filter by git branch
 ccfind --any foo bar               # any word instead of all
 ccfind --raw 'deploy NEAR/5 fail'  # FTS5 query syntax
 ccfind --json …                    # machine-readable output
 ccfind open 1                      # print `cd <dir> && claude --resume <id>` for result #1
 ccfind open 1 -x                   # …and run it (refused inside a Claude Code session)
-ccfind show c58a58b2 -g uber       # condensed transcript, optionally only the matching messages
+ccfind show 3f2a91 -g webhook      # condensed transcript, optionally only the matching messages
 ```
 
 - **What is searched:**
@@ -49,7 +49,7 @@ ccfind show c58a58b2 -g uber       # condensed transcript, optionally only the m
 
 ```sh
 ccfind stats                    # terminal report
-ccfind stats -p ems --since 30d # one project, last 30 days
+ccfind stats -p api --since 30d # one project, last 30 days
 ccfind stats --json             # all sections as JSON
 ccfind stats --html report.html # self-contained HTML with charts (no network requests)
 ```
