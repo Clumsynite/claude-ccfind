@@ -7,20 +7,25 @@ Standard library only.
 """
 import argparse
 import collections
+import contextlib
 import datetime as dt
+import fcntl
 import hashlib
 import html
 import json
 import math
 import os
+import plistlib
 import re
 import shlex
+import shutil
 import sqlite3
 import statistics
+import subprocess
 import sys
 import time
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 TEXT_CAP = 16384
 TOOL_CAP = 2048
 LIVE_SECS = 120
@@ -59,7 +64,7 @@ CREATE TABLE sessions(id TEXT PRIMARY KEY, project_dir TEXT, cwd TEXT, cwd_src T
                       branches TEXT, custom_title TEXT, ai_title TEXT, first_prompt TEXT,
                       started TEXT, ended TEXT, n_msgs INTEGER DEFAULT 0, n_user INTEGER DEFAULT 0,
                       n_assistant INTEGER DEFAULT 0, path TEXT, is_tmp INTEGER DEFAULT 0,
-                      meta_rowid INTEGER);
+                      meta_rowid INTEGER, entrypoint TEXT);
 -- docs holds the text; msgs is an external-content FTS5 index over it, kept in sync by triggers,
 -- so rows can be deleted per file through an ordinary index.
 CREATE TABLE docs(id INTEGER PRIMARY KEY, file_id INTEGER, session_id TEXT, role TEXT, ts TEXT, text TEXT);
@@ -83,7 +88,7 @@ CREATE TABLE edits(file_id INTEGER, session_id TEXT, tool_use_id TEXT, ts TEXT, 
                    added INTEGER, removed INTEGER, ok INTEGER DEFAULT 1, PRIMARY KEY(file_id, tool_use_id));
 CREATE TABLE events(file_id INTEGER, session_id TEXT, ts TEXT, kind TEXT, name TEXT);
 CREATE TABLE prompts(file_id INTEGER, session_id TEXT, ts TEXT, role TEXT, words INTEGER,
-                     lines INTEGER, queued INTEGER, clean TEXT);
+                     lines INTEGER, queued INTEGER, clean TEXT, raw_lines INTEGER);
 CREATE INDEX usage_s ON usage(session_id);
 CREATE INDEX edits_s ON edits(session_id, tool_use_id);
 CREATE INDEX events_s ON events(session_id);
@@ -110,28 +115,68 @@ def _secure(path):
             pass
 
 
-def connect(rebuild=False, mode=None):
-    """Open the index, creating or rebuilding it when needed. Returns a connection in autocommit mode."""
-    os.umask(0o077)
-    path = db_path()
-    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-    if rebuild:
-        _remove_db_files(path)
-    con = None
+@contextlib.contextmanager
+def index_lock(blocking=True, timeout=60):
+    """Exclusive lock for anything that writes the index. Yields True if acquired, False otherwise.
+    flock locks conflict between separate descriptors, even within one process, so never nest it."""
+    d = os.path.dirname(db_path())
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd = os.open(os.path.join(d, "index.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    got = False
     try:
-        con = sqlite3.connect(path, isolation_level=None, timeout=5)
-        row = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-        if not row or row[0] != SCHEMA_VERSION:
-            raise sqlite3.DatabaseError("schema mismatch")
+        deadline = time.time() + (timeout if blocking else 0)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                got = True
+                break
+            except BlockingIOError:
+                if time.time() >= deadline:
+                    break
+                time.sleep(0.1)
+        yield got
+    finally:
+        if got:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def busy_exit():
+    print("ccfind: index is busy (another ccfind is rebuilding it); try again shortly", file=sys.stderr)
+    raise SystemExit(4)
+
+
+def _schema_state(path):
+    """ok | old | newer | missing | bad, comparing the stored schema_version with ours."""
+    if not os.path.exists(path):
+        return "missing", None
+    c = None
+    try:
+        c = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=5)
+        row = c.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
     except sqlite3.DatabaseError:
-        if con is not None:
-            con.close()
-        old_mode = None if rebuild else _peek_mode(path)
-        _remove_db_files(path)
-        con = sqlite3.connect(path, isolation_level=None, timeout=5)
-        con.executescript(SCHEMA)
-        con.execute("INSERT INTO meta VALUES('schema_version', ?)", (SCHEMA_VERSION,))
-        con.execute("INSERT INTO meta VALUES('mode', ?)", (mode or old_mode or "text",))
+        return "bad", None
+    finally:
+        if c is not None:
+            c.close()
+    if not row:
+        return "bad", None
+    try:
+        stored = int(row[0])
+    except ValueError:
+        return "bad", row[0]
+    own = int(SCHEMA_VERSION)
+    return ("ok" if stored == own else "old" if stored < own else "newer"), row[0]
+
+
+def _newer_exit(stored):
+    print("ccfind: index was built by a newer ccfind (schema %s, this one understands %s); run the newer "
+          "version or delete %s" % (stored, SCHEMA_VERSION, os.path.dirname(db_path())), file=sys.stderr)
+    raise SystemExit(5)
+
+
+def _open(path):
+    con = sqlite3.connect(path, isolation_level=None, timeout=5)
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA busy_timeout=5000")
     con.execute("PRAGMA synchronous=NORMAL")
@@ -139,12 +184,55 @@ def connect(rebuild=False, mode=None):
     return con
 
 
+def _rebuild(path, mode):
+    old_mode = mode or _peek_mode(path)
+    _remove_db_files(path)
+    con = sqlite3.connect(path, isolation_level=None, timeout=5)
+    con.executescript(SCHEMA)
+    con.execute("INSERT INTO meta VALUES('schema_version', ?)", (SCHEMA_VERSION,))
+    con.execute("INSERT INTO meta VALUES('mode', ?)", (old_mode or "text",))
+    con.close()
+    return _open(path)
+
+
+def connect(rebuild=False, mode=None, locked=False):
+    """Open the index, creating or rebuilding it when needed. Returns a connection in autocommit mode.
+    Rebuilds happen only under the index lock; pass locked=True if the caller already holds it.
+    An index written by a newer schema is never downgraded (exit 5)."""
+    os.umask(0o077)
+    path = db_path()
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    if not rebuild:
+        state, stored = _schema_state(path)
+        if state == "ok":
+            return _open(path)
+        if state == "newer":
+            _newer_exit(stored)
+    if locked:
+        return _rebuild_checked(path, rebuild, mode)
+    with index_lock(True, 60) as got:
+        if not got:
+            busy_exit()
+        return _rebuild_checked(path, rebuild, mode)
+
+
+def _rebuild_checked(path, rebuild, mode):
+    if not rebuild:
+        # another process may have rebuilt it while we waited for the lock
+        state, stored = _schema_state(path)
+        if state == "ok":
+            return _open(path)
+        if state == "newer":
+            _newer_exit(stored)
+    return _rebuild(path, mode)
+
+
 def _peek_mode(path):
     if not os.path.exists(path):
         return None
     c = None
     try:
-        c = sqlite3.connect(path)
+        c = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
         row = c.execute("SELECT value FROM meta WHERE key='mode'").fetchone()
         return row[0] if row and row[0] in ("text", "deep") else None
     except sqlite3.DatabaseError:
@@ -310,6 +398,7 @@ class Chunk:
         self.first_prompt = None
         self.n_user = self.n_assistant = 0
         self.skipped = 0
+        self.entrypoint = None
 
     def seen_ts(self, ts):
         if isinstance(ts, str) and ts:
@@ -325,7 +414,9 @@ class Chunk:
         if stat_src:
             c = clean_text(stat_src)
             if c:
-                self.prompts.append((ts, "user", len(c.split()), nlines(stat_src), 1 if queued else 0, c[:TEXT_CAP]))
+                raw = sum(1 for ln in stat_src.splitlines() if ln.strip())
+                self.prompts.append((ts, "user", len(c.split()), nlines(stat_src), 1 if queued else 0,
+                                     c[:TEXT_CAP], raw))
         if self.first_prompt is None and kind == "prompt":
             self.first_prompt = " ".join(text.split())[:200]
 
@@ -339,6 +430,8 @@ def extract(rec, kind, mode, ch):
     ts = rec.get("timestamp")
     main = kind == "main"
     if main:
+        if ch.entrypoint is None and isinstance(rec.get("entrypoint"), str) and rec["entrypoint"]:
+            ch.entrypoint = rec["entrypoint"]
         if isinstance(rec.get("cwd"), str) and rec["cwd"]:
             ch.cwds.append(rec["cwd"])
         if isinstance(rec.get("gitBranch"), str) and rec["gitBranch"]:
@@ -422,7 +515,7 @@ def extract(rec, kind, mode, ch):
                 ch.n_assistant += 1
                 c = clean_text(text)
                 if c:
-                    ch.prompts.append((ts, "assistant", len(c.split()), nlines(text), 0, c[:TEXT_CAP]))
+                    ch.prompts.append((ts, "assistant", len(c.split()), nlines(text), 0, c[:TEXT_CAP], 0))
         elif bt == "tool_use":
             name = b.get("name") or "?"
             ch.events.append((ts, "tool", name))
@@ -521,6 +614,8 @@ def merge_session(con, sid, proj, path, ch):
                 "first_prompt=?, started=?, ended=?, n_msgs=?, n_user=?, n_assistant=?, is_tmp=?, path=? WHERE id=?",
                 (cwd, src, last, ",".join(sorted(bset)), ctitle, atitle, first, started, ended,
                  n_user + n_asst, n_user, n_asst, is_tmp, path, sid))
+    if ch.entrypoint:
+        con.execute("UPDATE sessions SET entrypoint=coalesce(entrypoint, ?) WHERE id=?", (ch.entrypoint, sid))
 
 
 def ensure_session(con, sid, proj, ch):
@@ -588,7 +683,7 @@ def index_file(con, path, sid, kind, proj, st, hh, mode, force_reset, counters):
             extract(rec, kind, mode, ch)
         con.executemany("INSERT INTO docs(file_id, session_id, role, ts, text) VALUES(?,?,?,?,?)",
                         [(file_id, sid, r, ts, tx) for r, ts, tx in ch.docs])
-        con.executemany("INSERT INTO prompts VALUES(?,?,?,?,?,?,?,?)",
+        con.executemany("INSERT INTO prompts VALUES(?,?,?,?,?,?,?,?,?)",
                         [(file_id, sid) + p for p in ch.prompts])
         con.executemany(
             "INSERT INTO usage VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(file_id, msg_id) DO UPDATE SET "
@@ -673,6 +768,8 @@ def index_all(con, root=None):
         except BaseException:
             con.execute("ROLLBACK")
             raise
+    con.execute("INSERT OR REPLACE INTO meta VALUES('last_index', ?)",
+                (dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),))
     counters["secs"] = round(time.time() - t0, 2)
     return counters
 
@@ -1489,9 +1586,187 @@ def render_html(s):
             + "".join(sections) + "</main></body></html>")
 
 
+# ---------------------------------------------------------------- launchd agent (macOS)
+
+AGENT_LABEL = "com.clumsyknight.ccfind"
+LOG_MAX = 1024 * 1024
+
+
+def agent_dir():
+    return os.environ.get("CCFIND_LAUNCH_AGENTS_DIR") or os.path.expanduser("~/Library/LaunchAgents")
+
+
+def agent_plist_path():
+    return os.path.join(agent_dir(), AGENT_LABEL + ".plist")
+
+
+def agent_log_path():
+    return os.path.join(os.path.dirname(db_path()), "agent.log")
+
+
+def launchctl():
+    return os.environ.get("CCFIND_LAUNCHCTL") or "/bin/launchctl"
+
+
+def agent_python():
+    """A stable interpreter path: the unversioned Homebrew symlink survives upgrades, sys.executable doesn't."""
+    if os.path.exists("/opt/homebrew/bin/python3"):
+        return "/opt/homebrew/bin/python3"
+    return shutil.which("python3") or sys.executable
+
+
+def agent_plist(interval, python, script, env):
+    return {
+        "Label": AGENT_LABEL,
+        "ProgramArguments": [python, script, "index", "--agent"],
+        "StartInterval": int(interval),
+        "RunAtLoad": True,
+        "ProcessType": "Background",
+        "LowPriorityIO": True,
+        "Nice": 10,
+        "StandardOutPath": agent_log_path(),
+        "StandardErrorPath": agent_log_path(),
+        "EnvironmentVariables": {k: v for k, v in env.items()
+                                 if k in ("CCFIND_DB", "CCFIND_ROOT", "CLAUDE_CONFIG_DIR") and v},
+    }
+
+
+def _lctl(*args):
+    return subprocess.run([launchctl()] + list(args), capture_output=True, text=True)
+
+
+def _domain():
+    return "gui/%d" % os.getuid()
+
+
+def agent_install(interval):
+    os.makedirs(os.path.dirname(agent_log_path()), mode=0o700, exist_ok=True)
+    os.makedirs(agent_dir(), exist_ok=True)
+    pl = agent_plist(interval, agent_python(), os.path.realpath(os.path.abspath(__file__)), os.environ)
+    with open(agent_plist_path(), "wb") as f:
+        plistlib.dump(pl, f)
+    target = "%s/%s" % (_domain(), AGENT_LABEL)
+    _lctl("bootout", target)
+    deadline = time.time() + 5
+    while time.time() < deadline and _lctl("print", target).returncode == 0:
+        time.sleep(0.2)  # let the old job drain, or bootstrap fails with 5
+    r = _lctl("bootstrap", _domain(), agent_plist_path())
+    if r.returncode == 5:
+        time.sleep(1)
+        r = _lctl("bootstrap", _domain(), agent_plist_path())
+    if r.returncode != 0:
+        print("ccfind: launchctl bootstrap failed (%d): %s" % (r.returncode, (r.stderr or r.stdout).strip()),
+              file=sys.stderr)
+        return 1
+    print("installed (every %d min); log: %s" % (round(interval / 60), agent_log_path()))
+    return 0
+
+
+def agent_uninstall():
+    _lctl("bootout", "%s/%s" % (_domain(), AGENT_LABEL))
+    try:
+        os.remove(agent_plist_path())
+    except FileNotFoundError:
+        pass
+    print("uninstalled")
+    return 0
+
+
+def _read_meta_ro(key):
+    path = db_path()
+    if not os.path.exists(path):
+        return None
+    c = None
+    try:
+        c = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+        row = c.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+    except sqlite3.DatabaseError:
+        return None
+    finally:
+        if c is not None:
+            c.close()
+
+
+def agent_status():
+    path = agent_plist_path()
+    installed = os.path.exists(path)
+    pl = {}
+    if installed:
+        try:
+            with open(path, "rb") as f:
+                pl = plistlib.load(f)
+        except (OSError, plistlib.InvalidFileException):
+            pl = {}
+    r = _lctl("print", "%s/%s" % (_domain(), AGENT_LABEL))
+    loaded = r.returncode == 0
+    m = re.search(r"last exit code = (\S+)", r.stdout or "")
+    print("installed %s" % ("yes" if installed else "no"))
+    print("loaded %s" % ("yes" if loaded else "no"))
+    if pl.get("StartInterval"):
+        print("interval %d min" % round(pl["StartInterval"] / 60))
+    if loaded:
+        print("last exit %s" % (m.group(1) if m else "?"))
+    last = _read_meta_ro("last_index")
+    d = parse_ts(last) if last else None
+    if d:
+        ago = (dt.datetime.now(dt.timezone.utc) - d).total_seconds() / 60
+        print("last index %s (%d min ago)" % (d.astimezone().strftime("%Y-%m-%d %H:%M"), ago))
+    else:
+        print("last index never")
+    try:
+        with open(agent_log_path()) as f:
+            tail = [ln.rstrip() for ln in f.readlines()[-3:] if ln.strip()]
+        for ln in tail:
+            print("log: " + ln)
+    except OSError:
+        pass
+    for p in (pl.get("ProgramArguments") or [])[:2]:
+        if not os.path.exists(p):
+            print("warning: %s no longer exists; run 'ccfind agent install' again" % p)
+    return 0
+
+
+def cmd_agent(args):
+    if sys.platform != "darwin":
+        print("ccfind: agent is macOS-only (launchd)", file=sys.stderr)
+        return 2
+    if args.action == "install":
+        if args.interval < 120:
+            print("ccfind: --interval must be at least 120 seconds", file=sys.stderr)
+            return 2
+        return agent_install(args.interval)
+    if args.action == "uninstall":
+        return agent_uninstall()
+    return agent_status()
+
+
+def index_for_agent(cons):
+    """What the launchd job runs: quiet, never waits, never fights another indexer."""
+    log = agent_log_path()
+    try:
+        if os.path.getsize(log) > LOG_MAX:
+            os.replace(log, log + ".1")  # launchd reopens the path on the next run
+    except OSError:
+        pass
+    try:
+        with index_lock(False) as got:
+            if not got:
+                return 0
+            con = connect(locked=True)
+            cons.append(con)
+            index_all(con)
+        return 0
+    except SystemExit:
+        raise
+    except Exception as e:  # launchd logs stderr; one line is enough
+        print("ccfind agent: %s: %s" % (type(e).__name__, e), file=sys.stderr)
+        return 1
+
+
 # ---------------------------------------------------------------- CLI
 
-COMMANDS = {"search", "open", "show", "index", "stats"}
+COMMANDS = {"search", "open", "show", "index", "stats", "agent"}
 
 
 def build_parser():
@@ -1507,7 +1782,9 @@ def build_parser():
     s.add_argument("--raw", action="store_true", help="pass FTS5 query syntax through unchanged")
     s.add_argument("--json", action="store_true")
     s.add_argument("--no-agents", action="store_true", help="ignore subagent transcripts")
-    s.add_argument("--no-tmp", action="store_true", help="ignore sessions under /tmp")
+    s.add_argument("--include-tmp", action="store_true",
+                   help="include headless (claude -p / SDK) sessions and sessions under /tmp, hidden by default")
+    s.add_argument("--no-tmp", action="store_true", help=argparse.SUPPRESS)  # old flag; now the default
     s.add_argument("--exclude-current", action="store_true", help="ignore $CLAUDE_CODE_SESSION_ID")
     s.add_argument("--no-index", action="store_true", help="skip the incremental index update")
     o = sub.add_parser("open", help="print (or run with -x) the command that resumes a session")
@@ -1520,6 +1797,7 @@ def build_parser():
     i.add_argument("--full", action="store_true", help="rebuild from scratch")
     i.add_argument("--mode", choices=["text", "deep"], help="text (default) or deep (adds tool calls/output)")
     i.add_argument("--stats", action="store_true", help="print what was done")
+    i.add_argument("--agent", action="store_true", help=argparse.SUPPRESS)  # used by the launchd job
     st = sub.add_parser("stats", help="word bank and usage stats")
     st.add_argument("-p", "--project")
     st.add_argument("--since")
@@ -1527,6 +1805,13 @@ def build_parser():
     st.add_argument("--json", action="store_true")
     st.add_argument("--html", metavar="FILE", help="also write a self-contained HTML report")
     st.add_argument("--no-index", action="store_true")
+    st.add_argument("--include-tmp", action="store_true",
+                    help="include headless (claude -p / SDK) sessions and sessions under /tmp")
+    st.add_argument("--max-prompt-lines", type=int, default=6, metavar="N",
+                    help="leave prompts with more than N non-empty lines (pastes) out of your word bank; 0 = keep all")
+    ag = sub.add_parser("agent", help="keep the index warm with a launchd job (macOS)")
+    ag.add_argument("action", choices=["install", "uninstall", "status"])
+    ag.add_argument("--interval", type=int, default=600, help="seconds between runs (min 120, default 600)")
     return ap
 
 
@@ -1544,26 +1829,35 @@ def main(argv=None):
 
 
 def run(args, cons):
+    if args.cmd == "index" and args.agent:
+        return index_for_agent(cons)
     if args.cmd == "index":
-        con = connect()
-        cur_mode = get_mode(con)
-        if args.full or (args.mode and args.mode != cur_mode):
-            con.close()
-            con = connect(rebuild=True, mode=args.mode or cur_mode)
-        cons.append(con)
-        c = index_all(con)
+        # one lock across open, optional rebuild and indexing
+        with index_lock(True, 60) as got:
+            if not got:
+                busy_exit()
+            con = connect(locked=True)
+            cur_mode = get_mode(con)
+            if args.full or (args.mode and args.mode != cur_mode):
+                con.close()
+                con = connect(rebuild=True, mode=args.mode or cur_mode, locked=True)
+            cons.append(con)
+            c = index_all(con)
         if args.stats:
             size = sum(os.path.getsize(db_path() + x) for x in ("", "-wal") if os.path.exists(db_path() + x))
             print(f"mode {get_mode(con)}  files {c['files']}  changed {c['changed']}  reset {c['reset']}  "
                   f"pruned {c['pruned']}  rows +{c['rows']}  skipped {c['skipped']}  {c['secs']}s  "
                   f"db {size / 1e6:.1f} MB")
         return 0
+    if args.cmd == "agent":
+        return cmd_agent(args)
     con = connect()
     cons.append(con)
-    if not getattr(args, "no_index", False) and args.cmd in ("search", "stats"):
-        index_all(con)
-    elif args.cmd in ("open", "show"):
-        index_all(con)
+    if not getattr(args, "no_index", False):
+        # best effort: if another ccfind is indexing, use the data as it is
+        with index_lock(False) as got:
+            if got:
+                index_all(con)
     if args.cmd == "search":
         res = search(con, args.terms, any_=args.any, raw=args.raw, no_agents=args.no_agents, no_tmp=args.no_tmp,
                      exclude_current=args.exclude_current, project=args.project, branch=args.branch,
