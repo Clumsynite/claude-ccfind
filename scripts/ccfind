@@ -197,11 +197,30 @@ TAG_BLOCK = re.compile(r"<(system-reminder|command-[a-z]+|local-command-[a-z]+)>
 PATHISH = re.compile(r"(?<!\w)(?:~|\.{1,2})?/[^\s]+|\S+/\S+")
 
 
+# Lines that look like pasted terminal/log output rather than prose.
+LOGLINE = re.compile(r"➜|^\s*(?:\$|>|#|==>|-->|\+|-\s|\||at\s)|git:\(|\d{1,2}:\d{2}:\d{2}|\b[A-Z_]{3,}=|"
+                     r"^\s*[\[{(]|[{};]\s*$|\\\s*$|\s-{1,2}[a-z][\w-]*(?:[= ]|$)|[✓✗✔✘│├└─•·]|"
+                     r"^\s*(?:npm (?:error|warn)|error:|warning:|info\b|debug\b|remote:|fast-forward|"
+                     r"environment variables loaded)", re.I)
+
+
+def prose_line(line):
+    t = line.strip()
+    if not t:
+        return False
+    if LOGLINE.search(t):
+        return False
+    visible = [ch for ch in t if not ch.isspace()]
+    letters = sum(ch.isalpha() for ch in visible)
+    return letters >= 0.75 * len(visible)
+
+
 def clean_text(s):
     s = PASTE.sub(" ", s)
     s = TAG_BLOCK.sub(" ", s)
     s = FENCE.sub(" ", s)
     s = INLINE.sub(" ", s)
+    s = "\n".join(line for line in s.splitlines() if prose_line(line))
     s = URL.sub(" ", s)
     s = IMG.sub(" ", s)
     s = PATHISH.sub(" ", s)
@@ -394,7 +413,7 @@ def extract(rec, kind, mode, ch):
         if bt == "text" and isinstance(b.get("text"), str) and b["text"].strip():
             text = b["text"].strip()
             ch.docs.append(("assistant" if main else "agent", ts, text[:TEXT_CAP]))
-            if main:
+            if main and model != "<synthetic>":  # synthetic = client-side error notices, not Claude
                 ch.n_assistant += 1
                 c = clean_text(text)
                 if c:
@@ -972,7 +991,8 @@ def templates(items, min_sessions=3, top=10, n=5):
                 e = phrases[ph]
                 e[0] += 1
                 e[1].add(sid)
-                e[2] = e[2] or raw
+                if e[2] is None or len(raw) < len(e[2]):
+                    e[2] = raw  # the shortest prompt containing the phrase is the clearest example
                 e[3].update(tuple(ws[k:k + n]) for k in range(i, j + 1))
                 i = j + n
             else:
