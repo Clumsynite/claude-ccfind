@@ -140,13 +140,18 @@ def connect(rebuild=False, mode=None):
 
 
 def _peek_mode(path):
+    if not os.path.exists(path):
+        return None
+    c = None
     try:
         c = sqlite3.connect(path)
         row = c.execute("SELECT value FROM meta WHERE key='mode'").fetchone()
-        c.close()
         return row[0] if row and row[0] in ("text", "deep") else None
     except sqlite3.DatabaseError:
         return None
+    finally:
+        if c is not None:
+            c.close()
 
 
 def get_mode(con):
@@ -1530,12 +1535,22 @@ def main(argv=None):
     if argv and argv[0] not in COMMANDS and argv[0] not in ("-h", "--help"):
         argv.insert(0, "search")
     args = build_parser().parse_args(argv)
+    cons = []
+    try:
+        return run(args, cons)
+    finally:
+        for c in cons:
+            c.close()
+
+
+def run(args, cons):
     if args.cmd == "index":
         con = connect()
         cur_mode = get_mode(con)
         if args.full or (args.mode and args.mode != cur_mode):
             con.close()
             con = connect(rebuild=True, mode=args.mode or cur_mode)
+        cons.append(con)
         c = index_all(con)
         if args.stats:
             size = sum(os.path.getsize(db_path() + x) for x in ("", "-wal") if os.path.exists(db_path() + x))
@@ -1544,6 +1559,7 @@ def main(argv=None):
                   f"db {size / 1e6:.1f} MB")
         return 0
     con = connect()
+    cons.append(con)
     if not getattr(args, "no_index", False) and args.cmd in ("search", "stats"):
         index_all(con)
     elif args.cmd in ("open", "show"):
