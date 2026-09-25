@@ -7,5 +7,7 @@
     "email": "clusmsyknight@gmail.com"
   },
   "license": "MIT",
+  "homepage": "https://github.com/Clumsynite/claude-ccfind",
+  "repository": "https://github.com/Clumsynite/claude-ccfind",
   "keywords": ["search", "session", "resume", "history", "stats", "fts5", "sqlite"]
 }

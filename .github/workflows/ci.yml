@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compile
+        run: python3 -m py_compile scripts/ccfind
+      - name: JSON manifests
+        run: jq -e . .claude-plugin/plugin.json .claude-plugin/marketplace.json > /dev/null
+      - name: Manifests agree
+        run: |
+          name=$(jq -r .name .claude-plugin/plugin.json)
+          jq -e --arg n "$name" '.plugins | map(.name) | index($n) != null' .claude-plugin/marketplace.json > /dev/null \
+            || { echo "::error::marketplace.json has no plugin named $name"; exit 1; }
+      - name: README release badge matches plugin.json
+        # The repo is private, so shields.io can't read releases; the badge is static instead.
+        run: |
+          version=$(jq -r .version .claude-plugin/plugin.json)
+          grep -q "img.shields.io/badge/release-v$version-blue" README.md \
+            || { echo "::error::README release badge doesn't say v$version; update it with the version bump"; exit 1; }
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: SQLite has FTS5
+        run: python3 -c "import sqlite3; print(sqlite3.sqlite_version); sqlite3.connect(':memory:').execute('create virtual table t using fts5(x)')"
+      - name: Tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Tests with the system Python
+        if: runner.os == 'macOS'
+        run: /usr/bin/python3 -m unittest discover -s tests -v
