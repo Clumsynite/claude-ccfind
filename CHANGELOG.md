@@ -4,11 +4,16 @@ All notable changes to ccfind are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-To release: add a section for the new version at the top, bump `version` in `.claude-plugin/plugin.json`
-and the README release badge to match, then push to `main`. CI refuses a version without a section here,
+To release: add a section for the new version at the top, bump `version` in `.claude-plugin/plugin.json`,
+then push to `main`. CI refuses a version without a section here,
 and the Release workflow tags `ccfind--v<version>`.
 
 ## [Unreleased]
+
+### Changed
+- The repository is now public. The README shows the live release badge (the static badge and its CI
+  check are gone), plus Claude Code, Python, dependency and platform badges. Install with
+  `/plugin marketplace add Clumsynite/claude-ccfind`.
 
 ## [0.1.1] - 2026-09-25
 

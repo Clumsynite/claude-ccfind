@@ -1,9 +1,13 @@
 # ccfind
 
 [![CI](https://github.com/Clumsynite/claude-ccfind/actions/workflows/ci.yml/badge.svg)](https://github.com/Clumsynite/claude-ccfind/actions/workflows/ci.yml)
-[![Release workflow](https://github.com/Clumsynite/claude-ccfind/actions/workflows/release.yml/badge.svg)](https://github.com/Clumsynite/claude-ccfind/actions/workflows/release.yml)
-[![Release](https://img.shields.io/badge/release-v0.1.1-blue)](https://github.com/Clumsynite/claude-ccfind/releases)
+[![Release](https://github.com/Clumsynite/claude-ccfind/actions/workflows/release.yml/badge.svg)](https://github.com/Clumsynite/claude-ccfind/actions/workflows/release.yml)
+[![Latest release](https://img.shields.io/github/v/release/Clumsynite/claude-ccfind?display_name=release)](https://github.com/Clumsynite/claude-ccfind/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-D97757?logo=claude&logoColor=white)](https://code.claude.com/docs/en/plugins)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen)](scripts/ccfind)
+[![Platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)](#keep-the-index-warm-macos)
 
 Find any past Claude Code session by what was said in it, across every project, then resume it. Also
 shows a **word bank and usage stats**:
@@ -114,18 +118,12 @@ The repo is also a plugin with two skills that call the script. The search itsel
 claude --plugin-dir /path/to/ccfind
 ```
 
-### Install from the private marketplace
-
-The GitHub repo is private. Claude Code clones it with your own git credentials, and it never prompts.
-With SSH access to the repo:
+### Install from the marketplace
 
 ```
-/plugin marketplace add git@github.com:Clumsynite/claude-ccfind.git
+/plugin marketplace add Clumsynite/claude-ccfind
 /plugin install ccfind@clumsyknight-ccfind
 ```
-
-If you use an SSH host alias for this GitHub account, put it in place of `github.com`. For HTTPS, run
-`gh auth login` and `gh auth setup-git` first, then add `https://github.com/Clumsynite/claude-ccfind.git`.
 
 ## Keep the index warm (macOS)
 
