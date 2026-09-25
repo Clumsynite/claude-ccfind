@@ -1,0 +1,15 @@
+{
+  "name": "clumsyknight-ccfind",
+  "owner": {
+    "name": "Clumsyknight",
+    "email": "clusmsyknight@gmail.com"
+  },
+  "description": "Local full-text search and usage stats across your Claude Code sessions.",
+  "plugins": [
+    {
+      "name": "ccfind",
+      "source": "./",
+      "description": "Find past sessions by content and resume them; word bank and usage stats."
+    }
+  ]
+}
