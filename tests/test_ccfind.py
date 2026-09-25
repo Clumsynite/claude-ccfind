@@ -401,6 +401,42 @@ class Stats(Base):
         self.assertIn("prefers-color-scheme", out)
 
 
+class Typos(Base):
+    def setUp(self):
+        super().setUp()
+        self.write(self.path("common"), [self.user("common", "compare the fares, message %d" % i)
+                                         for i in range(25)] + [self.user("common", "ride fares")])
+        self.write(self.path("typo"), [self.user("typo", "please comapre these")])
+        self.write(self.path("other"), [self.user("other", "unrelated words only")])
+        self.index()
+
+    def test_osa_distance(self):
+        self.assertEqual(cc.osa_distance("comapr", "compar", 2), 1)  # one adjacent swap
+        self.assertEqual(cc.osa_distance("kitten", "sitting", 3), 3)
+        self.assertEqual(cc.osa_distance("abc", "xyzabc", 1), 2)  # capped at limit + 1
+
+    def test_rare_word_also_matches_common_spelling(self):
+        notes = []
+        self.assertEqual(sorted(r["id"] for r in cc.search(self.con, ["comapre"], notes=notes)),
+                         ["common", "typo"])
+        self.assertTrue(any("comapre" in n for n in notes))
+        self.assertEqual(self.ids("fares", "comapre"), ["common"])
+
+    def test_exact_turns_it_off(self):
+        self.assertEqual(self.ids("comapre", exact=True), ["typo"])
+
+    def test_common_words_are_not_corrected(self):
+        notes = []
+        cc.search(self.con, ["compare"], notes=notes)
+        self.assertEqual(notes, [])
+
+    def test_hyphenated_term_without_phrase_hits_is_split(self):
+        notes = []
+        ids = [r["id"] for r in cc.search(self.con, ["ride-comapre"], notes=notes)]
+        self.assertEqual(ids, ["common"])
+        self.assertTrue(any("phrase" in n for n in notes))
+
+
 class Scope(Base):
     def test_headless_and_tmp_hidden_by_default(self):
         self.write(self.path("vis"), [self.user("vis", "zebrafish here")])

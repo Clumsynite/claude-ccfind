@@ -49,6 +49,11 @@ ccfind show 3f2a91 -g webhook      # condensed transcript, optionally only the m
 - **Not searched by default:** tool calls and outputs. `ccfind index --mode deep` adds them (capped at 2 KB
   each), which makes the index about 4x bigger. `--mode text` switches back.
 - **Filters:** `--no-agents`, `--exclude-current` and `--include-tmp` (see Defaults).
+- **Typos:** a word that appears in 5 or fewer messages, but is one or two edits (including a swapped pair
+  of letters) from a common word, also matches the common word. So `ccfind price comapre` finds
+  "price compare" sessions, and a line like `(comapre looks like a typo; also matching compar)` tells you.
+  A hyphenated or dotted term that matches nothing as a phrase is searched as separate words.
+  `--exact` turns both off.
 
 ## Defaults
 

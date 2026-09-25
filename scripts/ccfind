@@ -826,6 +826,114 @@ def fts_quote(tok):
     return '"' + core.replace('"', '""') + '"' + ("*" if star else "")
 
 
+RARE_DOCS = 5  # a word in at most this many messages may be a typo
+
+
+def osa_distance(a, b, limit):
+    """Optimal string alignment distance (edits plus adjacent swaps), or limit + 1 once it exceeds limit."""
+    if abs(len(a) - len(b)) > limit:
+        return limit + 1
+    prev2, prev = None, list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                cur[j] = min(cur[j], prev2[j - 2] + 1)
+        if min(cur) > limit:
+            return limit + 1
+        prev2, prev = prev, cur
+    return prev[-1]
+
+
+class Vocab:
+    """The index's own vocabulary (stemmed terms with document counts), used to fix typos."""
+
+    def __init__(self, con):
+        self.con = con
+        con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS temp.ccf_vocab USING fts5vocab(main, msgs, 'row')")
+        con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS temp.ccf_q USING fts5(x, tokenize='porter unicode61')")
+        con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS temp.ccf_qv USING fts5vocab(temp, ccf_q, 'instance')")
+        self._cands = None
+
+    def stems(self, text):
+        """Tokens of text exactly as the index tokenizer produces them."""
+        self.con.execute("DELETE FROM temp.ccf_q")
+        self.con.execute("INSERT INTO temp.ccf_q VALUES(?)", (text,))
+        return [r[0] for r in self.con.execute("SELECT term FROM temp.ccf_qv ORDER BY offset")]
+
+    def doc(self, term):
+        r = self.con.execute("SELECT doc FROM temp.ccf_vocab WHERE term=?", (term,)).fetchone()
+        return r[0] if r else 0
+
+    def phrase_hits(self, fts_q):
+        return self.con.execute("SELECT count(*) FROM (SELECT 1 FROM msgs WHERE msgs MATCH ? LIMIT 1)",
+                                (fts_q,)).fetchone()[0]
+
+    def corrections(self, word, stem, rare_doc):
+        """Common terms within 1–2 edits of a rare word, best first."""
+        if self._cands is None:
+            self._cands = self.con.execute("SELECT term, doc FROM temp.ccf_vocab WHERE doc >= 10 AND "
+                                           "length(term) >= 3 AND term GLOB '[a-z]*'").fetchall()
+        limit = 1 if len(word) <= 5 else 2
+        floor = max(10, 20 * rare_doc)
+        found, suffix = [], []
+        for term, doc in self._cands:
+            if doc < floor or term == stem:
+                continue
+            d = min(osa_distance(stem, term, limit), osa_distance(word, term, limit))
+            if d <= limit:
+                found.append((d, -doc, term))
+            elif len(term) >= 5 and len(word) > len(term) and len(word) - len(term) <= 4:
+                # a typo in a word's ending, which stops the stemmer from reducing it ("deploymnet" -> deploy)
+                d = osa_distance(word[:len(term)], term, limit)
+                if d <= limit:
+                    suffix.append((d, -doc, term))
+        found = sorted(found) or sorted(suffix)
+        # FTS5 re-stems query terms, so only offer stems that stem to themselves
+        return [t for _, _, t in found[:5] if self.stems(t) == [t]][:2]
+
+
+def build_queries(con, terms, exact, notes):
+    """One FTS5 expression per query term. Unless exact, rare words also match their common near-spellings,
+    and a hyphenated or dotted term that matches nothing as a phrase is split into words."""
+    if exact:
+        return [q for q in (fts_quote(t) for t in terms) if q]
+    vocab = Vocab(con)
+    queries = []
+    for t in terms:
+        q = fts_quote(t)
+        if not q:
+            continue
+        if t.endswith("*"):
+            queries.append(q)
+            continue
+        parts = vocab.stems(t)
+        if len(parts) > 1:
+            if vocab.phrase_hits(q):
+                queries.append(q)
+                continue
+            words = [w for w in re.split(r"[^\w]+", t) if w]
+            notes.append("%s matched nothing as a phrase; searching its words separately" % t)
+        else:
+            words = [t]
+        for w in words:
+            wq = fts_quote(w)
+            st = vocab.stems(w)
+            if len(st) != 1 or len(w) < 4 or not w.isalpha():
+                queries.append(wq)
+                continue
+            n = vocab.doc(st[0])
+            fixes = vocab.corrections(w.lower(), st[0], n) if n <= RARE_DOCS else []
+            if fixes:
+                notes.append("%s looks like a typo; also matching %s" % (w, " / ".join(fixes)))
+                queries.append("(" + " OR ".join([wq] + ['"%s"' % f for f in fixes]) + ")")
+            else:
+                queries.append(wq)
+    return queries
+
+
 RANK_SQL = """
 WITH hits AS MATERIALIZED (
   SELECT rowid, session_id, role, bm25(msgs) AS s FROM msgs WHERE msgs MATCH ?)
@@ -841,7 +949,8 @@ def hidden_session(is_tmp, entrypoint):
 
 
 def search(con, terms, any_=False, raw=False, no_agents=False, include_tmp=False, exclude_current=False,
-           project=None, branch=None, since=None, limit=10):
+           project=None, branch=None, since=None, limit=10, exact=False, notes=None):
+    notes = [] if notes is None else notes
     excluded_roles = ["tool"] if get_mode(con) != "deep" else []
     if no_agents:
         excluded_roles.append("agent")
@@ -852,7 +961,7 @@ def search(con, terms, any_=False, raw=False, no_agents=False, include_tmp=False
         queries = [" ".join(terms)]
         or_q = queries[0]
     else:
-        queries = [q for q in (fts_quote(t) for t in terms) if q]
+        queries = build_queries(con, terms, exact, notes)
         if not queries:
             return []
         or_q = " OR ".join(queries)
@@ -1796,6 +1905,7 @@ def build_parser():
     s.add_argument("-n", type=int, default=10)
     s.add_argument("--any", action="store_true", help="match any term instead of all")
     s.add_argument("--raw", action="store_true", help="pass FTS5 query syntax through unchanged")
+    s.add_argument("--exact", action="store_true", help="no typo tolerance: match words as spelled")
     s.add_argument("--json", action="store_true")
     s.add_argument("--no-agents", action="store_true", help="ignore subagent transcripts")
     s.add_argument("--include-tmp", action="store_true",
@@ -1875,10 +1985,14 @@ def run(args, cons):
             if got:
                 index_all(con)
     if args.cmd == "search":
+        notes = []
         res = search(con, args.terms, any_=args.any, raw=args.raw, no_agents=args.no_agents, include_tmp=args.include_tmp,
                      exclude_current=args.exclude_current, project=args.project, branch=args.branch,
-                     since=args.since, limit=args.n)
+                     since=args.since, limit=args.n, exact=args.exact, notes=notes)
         save_last(res)
+        if notes and not args.json:
+            for n in notes:
+                print("(" + n + ")")
         if args.json:
             print(json.dumps(res, indent=1))
         else:
