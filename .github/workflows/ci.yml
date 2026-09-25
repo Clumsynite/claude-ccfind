@@ -20,7 +20,7 @@ jobs:
       - name: Compile
         run: python3 -m py_compile scripts/ccfind
       - name: JSON manifests
-        run: jq -e . .claude-plugin/plugin.json .claude-plugin/marketplace.json > /dev/null
+        run: jq -e . .claude-plugin/plugin.json .claude-plugin/marketplace.json hooks/hooks.json > /dev/null
       - name: Manifests agree
         run: |
           name=$(jq -r .name .claude-plugin/plugin.json)

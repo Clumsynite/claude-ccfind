@@ -10,6 +10,20 @@ and the Release workflow tags `ccfind--v<version>`.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-25
+
+### Added
+- `ccfind --version`. `agent status` now also shows which copy of ccfind is running, and which copy the
+  agent runs, with both versions.
+- `ccfind link` writes a stable `~/.local/bin/ccfind` launcher (`--bin-dir` to choose where). It runs
+  the newest installed copy: the plugin install, or the copy that ran `link`, whichever is newer. So the
+  command keeps working after plugin updates move the plugin to a new versioned folder. It refuses to
+  overwrite a file that isn't a ccfind launcher unless you pass `--force`.
+- A plugin `SessionStart` hook runs `ccfind agent refresh`. If the launchd agent points at a copy of
+  ccfind that is gone or older than the plugin's (for example after an update), it is re-pointed. It's
+  silent, never fails a session, and does nothing off macOS or when no agent is installed.
+- An "Upgrading" section in the README.
+
 ### Changed
 - The repository is now public. The README shows the live release badge (the static badge and its CI
   check are gone), plus Claude Code, Python, dependency and platform badges. Install with
@@ -65,6 +79,7 @@ The first release.
   - The index and report files are private (0600).
 - **Claude Code plugin skills:** `/ccfind:find-session` and `/ccfind:session-stats`.
 
-[Unreleased]: https://github.com/Clumsynite/claude-ccfind/compare/ccfind--v0.1.1...HEAD
+[Unreleased]: https://github.com/Clumsynite/claude-ccfind/compare/ccfind--v0.1.2...HEAD
+[0.1.2]: https://github.com/Clumsynite/claude-ccfind/compare/ccfind--v0.1.1...ccfind--v0.1.2
 [0.1.1]: https://github.com/Clumsynite/claude-ccfind/compare/ccfind--v0.1.0...ccfind--v0.1.1
 [0.1.0]: https://github.com/Clumsynite/claude-ccfind/releases/tag/ccfind--v0.1.0

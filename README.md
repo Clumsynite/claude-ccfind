@@ -125,6 +125,21 @@ claude --plugin-dir /path/to/ccfind
 /plugin install ccfind@clumsyknight-ccfind
 ```
 
+## Upgrading
+
+- **Plugin installs** get a new version only when `version` in `plugin.json` changes. Update with
+  `/plugin marketplace update clumsyknight-ccfind` and then `/plugin update ccfind@clumsyknight-ccfind`,
+  or turn on auto-update for the marketplace under **Marketplaces** in `/plugin`. New sessions use the new
+  version.
+- **The terminal command:** run `ccfind link` once. Then `ccfind` always runs the newest installed copy,
+  so it doesn't break when a plugin update moves to a new versioned folder. Don't symlink into
+  `~/.claude/plugins/cache/…` yourself.
+- **The background agent** is re-pointed at the newest copy automatically at the start of each Claude
+  Code session. `ccfind agent status` shows the version each copy is on.
+- **Index format changes** rebuild the index once, automatically (about 15 s). An older copy never
+  downgrades a newer index; it exits with code 5 instead.
+- **What changed** in each version is in [CHANGELOG.md](CHANGELOG.md).
+
 ## Keep the index warm (macOS)
 
 ```sh

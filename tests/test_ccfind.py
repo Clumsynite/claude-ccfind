@@ -11,6 +11,7 @@ import os
 import plistlib
 import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -489,7 +490,12 @@ class Agent(Base):
         self.la = os.path.join(self.tmp.name, "LaunchAgents")
         self.saved = {k: os.environ.get(k) for k in ("CCFIND_LAUNCH_AGENTS_DIR", "CCFIND_LAUNCHCTL")}
         os.environ["CCFIND_LAUNCH_AGENTS_DIR"] = self.la
-        os.environ["CCFIND_LAUNCHCTL"] = shutil.which("true")
+        # fake launchctl: "print" says the job isn't loaded (113), everything else succeeds
+        fake = os.path.join(self.tmp.name, "launchctl")
+        with open(fake, "w") as f:
+            f.write('#!/bin/sh\n[ "$1" = print ] && exit 113\nexit 0\n')
+        os.chmod(fake, 0o755)
+        os.environ["CCFIND_LAUNCHCTL"] = fake
         self.platform = sys.platform
 
     def tearDown(self):
@@ -520,7 +526,6 @@ class Agent(Base):
 
     def test_install_and_uninstall(self):
         sys.platform = "darwin"
-        # the fake launchctl always "finds" the old job, so install waits out its 5 s drain timeout
         code, out = self.quiet(["agent", "install", "--interval", "600"])
         self.assertEqual(code, 0, out)
         plist = os.path.join(self.la, "com.clumsyknight.ccfind.plist")
@@ -541,6 +546,104 @@ class Agent(Base):
         self.assertEqual(code, 0)
         self.assertIn("installed no", out)
         self.assertFalse(os.path.exists(cc.db_path()))
+
+
+    def write_plist(self, script, interval=900):
+        os.makedirs(self.la, exist_ok=True)
+        pl = cc.agent_plist(interval, "/py", script, {})
+        with open(os.path.join(self.la, "com.clumsyknight.ccfind.plist"), "wb") as f:
+            plistlib.dump(pl, f)
+
+    def read_target(self):
+        with open(os.path.join(self.la, "com.clumsyknight.ccfind.plist"), "rb") as f:
+            return plistlib.load(f)
+
+    def fake_copy(self, version):
+        root = os.path.join(self.tmp.name, "copy-" + version)
+        os.makedirs(os.path.join(root, ".claude-plugin"))
+        os.makedirs(os.path.join(root, "scripts"))
+        with open(os.path.join(root, ".claude-plugin", "plugin.json"), "w") as f:
+            json.dump({"name": "ccfind", "version": version}, f)
+        script = os.path.join(root, "scripts", "ccfind")
+        with open(script, "w") as f:
+            f.write("import sys\nprint('fake %s', *sys.argv[1:])\n" % version)
+        return root, script
+
+    def test_refresh_repoints_a_missing_or_older_target(self):
+        sys.platform = "darwin"
+        self.write_plist("/gone/scripts/ccfind")
+        code, out = self.quiet(["agent", "refresh"])
+        self.assertEqual((code, out), (0, ""))
+        pl = self.read_target()
+        self.assertEqual(pl["ProgramArguments"][1], cc.this_script())
+        self.assertEqual(pl["StartInterval"], 900)  # keeps the user's interval
+        _, old = self.fake_copy("0.0.1")
+        self.write_plist(old)
+        self.quiet(["agent", "refresh"])
+        self.assertEqual(self.read_target()["ProgramArguments"][1], cc.this_script())
+
+    def test_refresh_keeps_a_newer_target_and_is_silent_elsewhere(self):
+        sys.platform = "darwin"
+        _, newer = self.fake_copy("99.0.0")
+        self.write_plist(newer)
+        self.assertEqual(self.quiet(["agent", "refresh"]), (0, ""))
+        self.assertEqual(self.read_target()["ProgramArguments"][1], newer)
+        sys.platform = "linux"
+        self.assertEqual(self.quiet(["agent", "refresh"]), (0, ""))
+
+    def test_refresh_without_agent_does_nothing(self):
+        sys.platform = "darwin"
+        self.assertEqual(self.quiet(["agent", "refresh"]), (0, ""))
+        self.assertFalse(os.path.exists(self.la))
+
+
+class VersionAndLink(Base):
+    def test_version(self):
+        with open(os.path.join(HERE, "..", ".claude-plugin", "plugin.json")) as f:
+            want = json.load(f)["version"]
+        self.assertEqual(self.run_main(["--version"]), (0, "ccfind %s\n" % want))
+        self.assertEqual(cc.script_version("/nowhere/scripts/ccfind"), (0,))
+
+    def test_link_writes_launcher_and_protects_other_files(self):
+        bindir = os.path.join(self.tmp.name, "bin")
+        code, out = self.run_main(["link", "--bin-dir", bindir])
+        self.assertEqual(code, 0)
+        dest = os.path.join(bindir, "ccfind")
+        self.assertTrue(os.access(dest, os.X_OK))
+        with open(dest) as f:
+            self.assertIn(cc.SHIM_MARKER, f.read())
+        self.assertEqual(self.run_main(["link", "--bin-dir", bindir])[0], 0)  # our own launcher: replaced
+        with open(dest, "w") as f:
+            f.write("#!/bin/sh\necho mine\n")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.run_main(["link", "--bin-dir", bindir])[0], 2)
+        self.assertEqual(self.run_main(["link", "--bin-dir", bindir, "--force"])[0], 0)
+        os.remove(dest)
+        os.symlink("/somewhere/else", dest)
+        self.assertEqual(self.run_main(["link", "--bin-dir", bindir])[0], 0)  # a symlink is replaced
+        self.assertFalse(os.path.islink(dest))
+
+    def test_launcher_runs_the_newest_copy(self):
+        bindir = os.path.join(self.tmp.name, "bin")
+        self.run_main(["link", "--bin-dir", bindir])
+        conf = os.path.join(self.tmp.name, "claude")
+        os.makedirs(os.path.join(conf, "plugins"))
+        env = dict(os.environ, CLAUDE_CONFIG_DIR=conf)
+
+        def installed(root):
+            with open(os.path.join(conf, "plugins", "installed_plugins.json"), "w") as f:
+                json.dump({"plugins": {"ccfind@m": [{"installPath": root}]}}, f)
+
+        def run():
+            return subprocess.run([sys.executable, os.path.join(bindir, "ccfind"), "--version"], env=env,
+                                  capture_output=True, text=True).stdout.strip()
+
+        root, _ = Agent.fake_copy(self, "99.0.0")
+        installed(root)
+        self.assertEqual(run(), "fake 99.0.0 --version")
+        root, _ = Agent.fake_copy(self, "0.0.1")
+        installed(root)
+        self.assertEqual(run(), "ccfind " + cc.version_string())
 
 
 class Locking(Base):

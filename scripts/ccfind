@@ -12,6 +12,7 @@ import datetime as dt
 import fcntl
 import hashlib
 import html
+import io
 import json
 import math
 import os
@@ -31,7 +32,28 @@ TOOL_CAP = 2048
 LIVE_SECS = 120
 EDIT_TOOLS = ("Edit", "MultiEdit", "Write", "NotebookEdit")
 
-# ---------------------------------------------------------------- paths
+# ---------------------------------------------------------------- version and paths
+
+
+def script_version(script):
+    """The plugin.json version next to a ccfind script (scripts/ccfind -> .claude-plugin/plugin.json)."""
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.realpath(script)))
+        with open(os.path.join(root, ".claude-plugin", "plugin.json")) as f:
+            v = json.load(f)["version"]
+        return tuple(int(x) for x in v.split("."))
+    except (OSError, ValueError, KeyError, AttributeError):
+        return (0,)
+
+
+def this_script():
+    return os.path.realpath(os.path.abspath(__file__))
+
+
+def version_string(script=None):
+    v = script_version(script or this_script())
+    return ".".join(str(x) for x in v) if v != (0,) else "unknown"
+
 
 
 def projects_root():
@@ -1717,6 +1739,78 @@ def render_html(s):
             + "".join(sections) + "</main></body></html>")
 
 
+# ---------------------------------------------------------------- stable launcher (ccfind link)
+
+SHIM_MARKER = "# ccfind launcher, written by 'ccfind link'."
+SHIM = """#!/usr/bin/env python3
+%s
+# Runs the newest installed ccfind: the Claude Code plugin install, or the copy that wrote this file,
+# whichever has the higher version (ties go to the copy that wrote it). Safe across plugin updates.
+import json
+import os
+import sys
+
+LINKED = %%r
+
+
+def version(script):
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.realpath(script)))
+        with open(os.path.join(root, ".claude-plugin", "plugin.json")) as f:
+            return tuple(int(x) for x in json.load(f)["version"].split("."))
+    except Exception:
+        return (0,)
+
+
+def plugin_copies():
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    try:
+        with open(os.path.join(base, "plugins", "installed_plugins.json")) as f:
+            plugins = json.load(f).get("plugins", {})
+    except Exception:
+        return
+    for key, entries in plugins.items():
+        if key.split("@")[0] != "ccfind":
+            continue
+        for e in entries if isinstance(entries, list) else [entries]:
+            p = os.path.join((e or {}).get("installPath") or "", "scripts", "ccfind")
+            if os.path.isfile(p):
+                yield p
+
+
+copies = ([LINKED] if os.path.isfile(LINKED) else []) + list(plugin_copies())
+if not copies:
+    sys.exit("ccfind: no installed copy found; reinstall the plugin, then run 'ccfind link' again")
+target = max(copies, key=lambda p: (version(p), p == LINKED))
+os.execv(sys.executable, [sys.executable, target] + sys.argv[1:])
+""" % SHIM_MARKER
+
+
+def cmd_link(args):
+    bin_dir = os.path.expanduser(args.bin_dir)
+    dest = os.path.join(bin_dir, "ccfind")
+    if os.path.lexists(dest) and not os.path.islink(dest):
+        try:
+            with open(dest) as f:
+                ours = SHIM_MARKER in f.read(4096)
+        except (OSError, UnicodeDecodeError):
+            ours = False
+        if not ours and not args.force:
+            print("ccfind: %s exists and isn't a ccfind launcher; use --force to replace it" % dest,
+                  file=sys.stderr)
+            return 2
+    os.makedirs(bin_dir, exist_ok=True)
+    tmp = dest + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(SHIM % this_script())
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, dest)  # also replaces an old symlink
+    print("linked %s (runs the newest installed ccfind; now %s)" % (dest, version_string()))
+    if bin_dir not in os.environ.get("PATH", "").split(os.pathsep):
+        print("note: %s is not on your PATH" % bin_dir)
+    return 0
+
+
 # ---------------------------------------------------------------- launchd agent (macOS)
 
 AGENT_LABEL = "com.clumsyknight.ccfind"
@@ -1832,6 +1926,7 @@ def agent_status():
     r = _lctl("print", "%s/%s" % (_domain(), AGENT_LABEL))
     loaded = r.returncode == 0
     m = re.search(r"last exit code = (\S+)", r.stdout or "")
+    print("ccfind %s (%s)" % (version_string(), this_script()))
     print("installed %s" % ("yes" if installed else "no"))
     print("loaded %s" % ("yes" if loaded else "no"))
     if pl.get("StartInterval"):
@@ -1852,16 +1947,44 @@ def agent_status():
             print("log: " + ln)
     except OSError:
         pass
-    for p in (pl.get("ProgramArguments") or [])[:2]:
+    prog = pl.get("ProgramArguments") or []
+    if len(prog) > 1 and os.path.exists(prog[1]):
+        print("agent runs %s (version %s)" % (prog[1], version_string(prog[1])))
+    for p in prog[:2]:
         if not os.path.exists(p):
             print("warning: %s no longer exists; run 'ccfind agent install' again" % p)
     return 0
 
 
+def agent_refresh():
+    """Run by the plugin's SessionStart hook: if the agent points at a copy of ccfind that is gone or
+    older than this one (for example after a plugin update), point it here. Silent, and never fails."""
+    path = agent_plist_path()
+    if not os.path.exists(path):
+        return 0
+    try:
+        with open(path, "rb") as f:
+            pl = plistlib.load(f)
+        args = pl.get("ProgramArguments") or []
+        target = args[1] if len(args) > 1 else ""
+        me = this_script()
+        if target == me or (os.path.isfile(target) and script_version(target) >= script_version(me)):
+            return 0
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            agent_install(int(pl.get("StartInterval") or 600))
+    except Exception:
+        pass
+    return 0
+
+
 def cmd_agent(args):
     if sys.platform != "darwin":
+        if args.action == "refresh":
+            return 0  # the hook runs everywhere; there's nothing to refresh off macOS
         print("ccfind: agent is macOS-only (launchd)", file=sys.stderr)
         return 2
+    if args.action == "refresh":
+        return agent_refresh()
     if args.action == "install":
         if args.interval < 120:
             print("ccfind: --interval must be at least 120 seconds", file=sys.stderr)
@@ -1897,7 +2020,7 @@ def index_for_agent(cons):
 
 # ---------------------------------------------------------------- CLI
 
-COMMANDS = {"search", "open", "show", "index", "stats", "agent"}
+COMMANDS = {"search", "open", "show", "index", "stats", "agent", "link"}
 
 
 def build_parser():
@@ -1942,13 +2065,19 @@ def build_parser():
     st.add_argument("--max-prompt-lines", type=int, default=6, metavar="N",
                     help="leave prompts with more than N non-empty lines (pastes) out of your word bank; 0 = keep all")
     ag = sub.add_parser("agent", help="keep the index warm with a launchd job (macOS)")
-    ag.add_argument("action", choices=["install", "uninstall", "status"])
+    ag.add_argument("action", choices=["install", "uninstall", "status", "refresh"])
     ag.add_argument("--interval", type=int, default=600, help="seconds between runs (min 120, default 600)")
+    ln = sub.add_parser("link", help="install a stable ccfind command that survives plugin updates")
+    ln.add_argument("--bin-dir", default="~/.local/bin", help="where to write it (default ~/.local/bin)")
+    ln.add_argument("--force", action="store_true", help="replace an existing file that isn't a ccfind launcher")
     return ap
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ("--version", "-V"):
+        print("ccfind " + version_string())
+        return 0
     if argv and argv[0] not in COMMANDS and argv[0] not in ("-h", "--help"):
         argv.insert(0, "search")
     args = build_parser().parse_args(argv)
@@ -1983,6 +2112,8 @@ def run(args, cons):
         return 0
     if args.cmd == "agent":
         return cmd_agent(args)
+    if args.cmd == "link":
+        return cmd_link(args)
     con = connect()
     cons.append(con)
     if not getattr(args, "no_index", False):
