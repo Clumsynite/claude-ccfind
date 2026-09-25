@@ -1,5 +1,10 @@
 # ccfind
 
+[![CI](https://github.com/Clumsynite/claude-ccfind/actions/workflows/ci.yml/badge.svg)](https://github.com/Clumsynite/claude-ccfind/actions/workflows/ci.yml)
+[![Release workflow](https://github.com/Clumsynite/claude-ccfind/actions/workflows/release.yml/badge.svg)](https://github.com/Clumsynite/claude-ccfind/actions/workflows/release.yml)
+[![Release](https://img.shields.io/badge/release-v0.1.0-blue)](https://github.com/Clumsynite/claude-ccfind/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Find any past Claude Code session by what was said in it, across every project, then resume it. Also
 shows a **word bank and usage stats**:
 - the words and openers you use most
@@ -43,7 +48,15 @@ ccfind show 3f2a91 -g webhook      # condensed transcript, optionally only the m
   - session titles, project paths and branches
 - **Not searched by default:** tool calls and outputs. `ccfind index --mode deep` adds them (capped at 2 KB
   each), which makes the index about 4x bigger. `--mode text` switches back.
-- **Filters:** `--no-agents`, `--no-tmp` (sessions under `/tmp`) and `--exclude-current`.
+- **Filters:** `--no-agents`, `--exclude-current` and `--include-tmp` (see Defaults).
+
+## Defaults
+
+Search and stats hide headless sessions (`claude -p` / SDK runs, recorded as `entrypoint: sdk-cli`)
+and sessions whose working directory is under `/tmp`. These are usually test runs or scratch sessions
+that repeat your query word for word. Add `--include-tmp` to bring them back.
+
+`agent` is a subcommand, so to search for the word "agent" write `ccfind search agent`.
 
 ## Stats
 
@@ -73,6 +86,11 @@ The report has these sections:
 Pasted blocks, code, URLs, file paths, image placeholders and lines that look like terminal output are
 stripped before words are counted. Each word counts once per message.
 
+Prompts with more than 6 non-empty lines are almost always pasted output (logs, tool results). They are
+left out of *your* word bank, which covers words, pairs, openers and templates, but they still count
+everywhere else. The report says how many were left out (`paste_like_excluded` in `--json`). Change the
+limit with `--max-prompt-lines N`, or turn it off with `0`.
+
 **Cost** appears only if you create `~/.config/ccfind/prices.json` with $ per million tokens for each
 model, copied from https://www.anthropic.com/pricing:
 
@@ -89,6 +107,36 @@ The repo is also a plugin with two skills that call the script. The search itsel
 ```sh
 claude --plugin-dir /path/to/ccfind
 ```
+
+### Install from the private marketplace
+
+The GitHub repo is private. Claude Code clones it with your own git credentials, and it never prompts.
+With SSH access to the repo:
+
+```
+/plugin marketplace add git@github.com:Clumsynite/claude-ccfind.git
+/plugin install ccfind@clumsyknight-ccfind
+```
+
+If you use an SSH host alias for this GitHub account, put it in place of `github.com`. For HTTPS, run
+`gh auth login` and `gh auth setup-git` first, then add `https://github.com/Clumsynite/claude-ccfind.git`.
+
+## Keep the index warm (macOS)
+
+```sh
+ccfind agent install              # launchd job: runs `ccfind index` every 10 min, low priority
+ccfind agent install --interval 1800
+ccfind agent status               # installed / loaded / last exit / last index / log tail
+ccfind agent uninstall
+```
+
+The job runs quietly and never waits. If another ccfind is already indexing, it skips that run. Errors go
+to `~/.cache/ccfind/agent.log`, which is rotated to `agent.log.1` past 1 MB. It runs
+`/opt/homebrew/bin/python3` when that exists. If the Python or the script moves, `agent status` warns you
+to run `agent install` again.
+
+Only one ccfind indexes at a time; a file lock next to the database enforces that. An older ccfind never
+downgrades an index built by a newer one: it exits with code 5 and tells you so.
 
 ## Privacy
 

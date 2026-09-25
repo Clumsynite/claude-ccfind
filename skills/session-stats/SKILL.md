@@ -7,7 +7,7 @@ allowed-tools: Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/ccfind" *)
 
 # Session stats
 
-The stats come from the `ccfind` script's local index. Don't compute them any other way, and don't read transcript files.
+The stats come from the `ccfind` script's local index. Don't compute them any other way, and don't read transcript files. Headless (`claude -p`) and `/tmp` sessions are excluded unless `--include-tmp` is passed.
 
 ## Steps
 

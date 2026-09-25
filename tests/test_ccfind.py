@@ -8,7 +8,10 @@ import importlib.util
 import io
 import json
 import os
+import plistlib
 import shlex
+import shutil
+import sys
 import tempfile
 import unittest
 
@@ -396,6 +399,137 @@ class Stats(Base):
         self.assertNotRegex(out, r"<script[^>]+src=|<link[^>]+href=.https?:|@import")
         self.assertIn("<svg", out)
         self.assertIn("prefers-color-scheme", out)
+
+
+class Scope(Base):
+    def test_headless_and_tmp_hidden_by_default(self):
+        self.write(self.path("vis"), [self.user("vis", "zebrafish here")])
+        self.write(self.path("hl"), [self.user("hl", "zebrafish headless", entrypoint="sdk-cli")])
+        self.write(self.path("tp", cwd="/tmp/x"), [self.user("tp", "zebrafish scratch", cwd="/tmp/x")])
+        self.index()
+        self.assertEqual(self.ids("zebrafish"), ["vis"])
+        self.assertEqual(sorted(self.ids("zebrafish", include_tmp=True)), ["hl", "tp", "vis"])
+        self.assertEqual(cc.compute_stats(self.con)["overview"]["sessions"], 1)
+        self.assertEqual(cc.compute_stats(self.con, include_tmp=True)["overview"]["sessions"], 3)
+        ep = dict(self.con.execute("SELECT id, entrypoint FROM sessions"))
+        self.assertEqual(ep["hl"], "sdk-cli")
+
+
+class PasteFilter(Base):
+    def test_raw_lines_counts_non_empty_lines(self):
+        self.write(self.path("s1"), [self.user("s1", "one\n\ntwo\n   \nthree")])
+        self.index()
+        self.assertEqual(self.con.execute("SELECT raw_lines FROM prompts WHERE role='user'").fetchone()[0], 3)
+
+    def test_pastes_left_out_of_word_bank(self):
+        paste = "\n".join("kestrel falcon osprey harrier merlin line%d" % i for i in range(7))
+        for i in range(3):
+            sid = "p%d" % i
+            self.write(self.path(sid), [self.user(sid, paste)])
+        self.index()
+        s = cc.compute_stats(self.con)
+        self.assertFalse(any("kestrel" in t["phrase"] for t in s["your_words"]["templates"]))
+        self.assertEqual(s["your_words"]["paste_like_excluded"], 3)
+        s0 = cc.compute_stats(self.con, max_prompt_lines=0)
+        self.assertTrue(any("kestrel" in t["phrase"] for t in s0["your_words"]["templates"]))
+        self.assertEqual(s0["your_words"]["paste_like_excluded"], 0)
+
+
+class Agent(Base):
+    def setUp(self):
+        super().setUp()
+        self.la = os.path.join(self.tmp.name, "LaunchAgents")
+        self.saved = {k: os.environ.get(k) for k in ("CCFIND_LAUNCH_AGENTS_DIR", "CCFIND_LAUNCHCTL")}
+        os.environ["CCFIND_LAUNCH_AGENTS_DIR"] = self.la
+        os.environ["CCFIND_LAUNCHCTL"] = shutil.which("true")
+        self.platform = sys.platform
+
+    def tearDown(self):
+        sys.platform = self.platform
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        super().tearDown()
+
+    def quiet(self, argv):
+        with contextlib.redirect_stderr(io.StringIO()):
+            return self.run_main(argv)
+
+    def test_plist_round_trip(self):
+        pl = cc.agent_plist(600, "/py", "/s/ccfind", {"CCFIND_DB": "/d/i.db", "HOME": "/h", "CCFIND_ROOT": ""})
+        back = plistlib.loads(plistlib.dumps(pl))
+        self.assertEqual(back["Label"], "com.clumsyknight.ccfind")
+        self.assertEqual(back["ProgramArguments"], ["/py", "/s/ccfind", "index", "--agent"])
+        self.assertEqual(back["StartInterval"], 600)
+        self.assertTrue(back["RunAtLoad"])
+        self.assertTrue(back["LowPriorityIO"])
+        self.assertEqual(back["ProcessType"], "Background")
+        self.assertEqual(back["Nice"], 10)
+        self.assertEqual(back["EnvironmentVariables"], {"CCFIND_DB": "/d/i.db"})
+        self.assertEqual(back["StandardErrorPath"], os.path.join(os.path.dirname(cc.db_path()), "agent.log"))
+
+    def test_install_and_uninstall(self):
+        sys.platform = "darwin"
+        # the fake launchctl always "finds" the old job, so install waits out its 5 s drain timeout
+        code, out = self.quiet(["agent", "install", "--interval", "600"])
+        self.assertEqual(code, 0, out)
+        plist = os.path.join(self.la, "com.clumsyknight.ccfind.plist")
+        self.assertTrue(os.path.exists(plist))
+        code, out = self.quiet(["agent", "uninstall"])
+        self.assertEqual(code, 0)
+        self.assertFalse(os.path.exists(plist))
+
+    def test_interval_minimum_and_non_mac(self):
+        sys.platform = "darwin"
+        self.assertEqual(self.quiet(["agent", "install", "--interval", "60"])[0], 2)
+        sys.platform = "linux"
+        self.assertEqual(self.quiet(["agent", "status"])[0], 2)
+
+    def test_status_does_not_create_db(self):
+        sys.platform = "darwin"
+        code, out = self.quiet(["agent", "status"])
+        self.assertEqual(code, 0)
+        self.assertIn("installed no", out)
+        self.assertFalse(os.path.exists(cc.db_path()))
+
+
+class Locking(Base):
+    def test_busy_lock_skips_auto_index(self):
+        self.write(self.path("s1"), [self.user("s1", "heron first")])
+        self.index()
+        self.write(self.path("s1"), [self.user("s1", "ibis later")], mode="a")
+        with cc.index_lock(True, 1) as got:
+            self.assertTrue(got)
+            with cc.index_lock(True, 0.3) as got2:
+                self.assertFalse(got2)
+            code, out = self.run_main(["heron"])
+            self.assertIn("s1", out)
+            code, out = self.run_main(["ibis"])
+            self.assertIn("no matches", out)  # not indexed: another indexer holds the lock
+            self.assertEqual(self.run_main(["index", "--agent"])[0], 0)
+        code, out = self.run_main(["ibis"])
+        self.assertIn("s1", out)
+
+    def test_old_schema_rebuilt_newer_refused(self):
+        self.write(self.path("s1"), [self.user("s1", "hello")])
+        self.index()
+        self.con.execute("UPDATE meta SET value='2' WHERE key='schema_version'")
+        self.con.close()
+        self.con = cc.connect()
+        self.assertEqual(self.con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0],
+                         cc.SCHEMA_VERSION)
+        self.con.execute("UPDATE meta SET value='99' WHERE key='schema_version'")
+        self.con.close()
+        self.con = None
+        st = os.stat(cc.db_path())
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as e:
+                cc.connect()
+        self.assertEqual(e.exception.code, 5)
+        st2 = os.stat(cc.db_path())
+        self.assertEqual((st.st_size, st.st_mtime), (st2.st_size, st2.st_mtime))
 
 
 if __name__ == "__main__":
